@@ -11,6 +11,7 @@
 
 use asr::{
     future::{next_tick, retry},
+    settings::Gui,
     timer,
     timer::TimerState,
     watcher::Watcher,
@@ -21,47 +22,54 @@ asr::panic_handler!();
 asr::async_main!(nightly);
 
 async fn main() {
-    let settings = Settings::register();
+    let mut settings = Settings::register();
 
     loop {
         // Hook to the target process
         let process = retry(|| PROCESS_NAMES.into_iter().find_map(Process::attach)).await;
 
-        process.until_closes(async {
-            // Once the target has been found and attached to, set up default watchers
-            let mut watchers = Watchers::default();
+        process
+            .until_closes(async {
+                // Once the target has been found and attached to, set up default watchers
+                let mut watchers = Watchers::default();
 
-            let wram_base = retry(|| process
-                .memory_ranges()
-                .find(|x| x.size().unwrap_or_default() == 0x521000)?
-                .address().ok()
-            ).await + 0x400020;
+                let wram_base = retry(|| {
+                    process
+                        .memory_ranges()
+                        .find(|x| x.size().unwrap_or_default() == 0x521000)?
+                        .address()
+                        .ok()
+                })
+                .await
+                    + 0x400020;
 
-            loop {
-                // Splitting logic. Adapted from OG LiveSplit:
-                // Order of execution
-                // 1. update() will always be run first. There are no conditions on the execution of this action.
-                // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
-                // 3. If reset does not return true, then the split action will be run.
-                // 4. If the timer is currently not running (and not paused), then the start action will be run.
-                update_loop(&mut watchers, &process, wram_base);
+                loop {
+                    // Splitting logic. Adapted from OG LiveSplit:
+                    // Order of execution
+                    // 1. update() will always be run first. There are no conditions on the execution of this action.
+                    // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
+                    // 3. If reset does not return true, then the split action will be run.
+                    // 4. If the timer is currently not running (and not paused), then the start action will be run.
+                    settings.update();
+                    update_loop(&mut watchers, &process, wram_base);
 
-                let timer_state = timer::state();
-                if timer_state == TimerState::Running || timer_state == TimerState::Paused {
-                    if reset(&watchers, &settings) {
-                        timer::reset()
-                    } else if split(&watchers, &settings) {
-                        timer::split()
+                    let timer_state = timer::state();
+                    if timer_state == TimerState::Running || timer_state == TimerState::Paused {
+                        if reset(&watchers, &settings) {
+                            timer::reset()
+                        } else if split(&watchers, &settings) {
+                            timer::split()
+                        }
                     }
-                }
 
-                if timer::state() == TimerState::NotRunning && start(&watchers, &settings) {
-                    timer::start();
-                }
+                    if timer::state() == TimerState::NotRunning && start(&watchers, &settings) {
+                        timer::start();
+                    }
 
-                next_tick().await;
-            }
-        }).await;
+                    next_tick().await;
+                }
+            })
+            .await;
     }
 }
 
@@ -77,7 +85,7 @@ struct Watchers {
     save_slot: Watcher<u8>,
 }
 
-#[derive(asr::Settings)]
+#[derive(Gui)]
 struct Settings {
     #[default = true]
     /// START: Auto start (No save)
@@ -174,35 +182,76 @@ struct Settings {
 fn update_loop(watchers: &mut Watchers, process: &Process, wram_base: Address) {
     // Filtered state variables. They essentially exclude State.InGame
     // Used in order to fix a couple of bugs that will otherwise appear with the start trigger
-    let mut state = match &watchers.state.pair { Some(x) => x.current, _ => 0 };
-    let mut save_slot = match &watchers.save_slot.pair { Some(x) => x.current, _ => 0 };
-    let save_select = process.read::<u8>(wram_base + 0xEF4B).ok().unwrap_or_default();
-    let cstate = process.read::<u8>(wram_base + 0xF600).ok().unwrap_or_default();
+    let mut state = match &watchers.state.pair {
+        Some(x) => x.current,
+        _ => 0,
+    };
+    let mut save_slot = match &watchers.save_slot.pair {
+        Some(x) => x.current,
+        _ => 0,
+    };
+    let save_select = process
+        .read::<u8>(wram_base + 0xEF4B)
+        .ok()
+        .unwrap_or_default();
+    let cstate = process
+        .read::<u8>(wram_base + 0xF600)
+        .ok()
+        .unwrap_or_default();
 
     if cstate != STATE_INGAME {
         state = cstate;
 
         if save_select > 0 && save_select <= 8 {
-            save_slot = process.read::<u8>(wram_base + 0xE6AC + 0xA * (save_select as u64 - 1)).ok().unwrap_or_default();
+            save_slot = process
+                .read::<u8>(wram_base + 0xE6AC + 0xA * (save_select as u64 - 1))
+                .ok()
+                .unwrap_or_default();
         }
     }
 
-    let mut zone_select = match &watchers.zone_select.pair { Some(x) => x.current, _ => 0 };
+    let mut zone_select = match &watchers.zone_select.pair {
+        Some(x) => x.current,
+        _ => 0,
+    };
 
     if save_select > 0 && save_select <= 8 {
-        zone_select = process.read::<u8>(wram_base + 0xB15F + 0x4A * (save_select as u64 - 1)).ok().unwrap_or_default();
+        zone_select = process
+            .read::<u8>(wram_base + 0xB15F + 0x4A * (save_select as u64 - 1))
+            .ok()
+            .unwrap_or_default();
     }
 
     // Define current Act
     // As act = 0 can both mean Angel Island Act 1 and main menu, we need to check if the LevelStarted flag is set.
     // If it's not, keep the old value (old.act) in order to allow splitting after returning to the main menu.
-    let mut act = match &watchers.levelid.pair { Some(x) => x.current, _ => Levels::AngelIslandAct1 };
+    let mut act = match &watchers.levelid.pair {
+        Some(x) => x.current,
+        _ => Levels::AngelIslandAct1,
+    };
 
-    let temp_act = process.read::<u8>(wram_base + 0xEE4F).ok().unwrap_or_default();
-    let temp_zone = process.read::<u8>(wram_base + 0xEE4E).ok().unwrap_or_default();
+    let temp_act = process
+        .read::<u8>(wram_base + 0xEE4F)
+        .ok()
+        .unwrap_or_default();
+    let temp_zone = process
+        .read::<u8>(wram_base + 0xEE4E)
+        .ok()
+        .unwrap_or_default();
 
     act = match temp_act + temp_zone * 10 {
-        0 => if process.read::<u8>(wram_base + 0xF711).ok().unwrap_or_default() != 0 { Levels::AngelIslandAct1 } else { act },
+        0 => {
+            if process
+                .read::<u8>(wram_base + 0xF711)
+                .ok()
+                .unwrap_or_default()
+                != 0
+            {
+                Levels::AngelIslandAct1
+            } else {
+                act
+            }
+        }
         1 => Levels::AngelIslandAct2,
         10 => Levels::HydrocityAct1,
         11 => Levels::HydrocityAct2,
@@ -234,33 +283,59 @@ fn update_loop(watchers: &mut Watchers, process: &Process, wram_base: Address) {
     // Update the watchers
     watchers.levelid.update_infallible(act);
     watchers.state.update_infallible(state);
-    watchers.end_of_level_flag.update_infallible(process.read::<u8>(wram_base + 0xFAA8).ok().unwrap_or_default() != 0);
-    watchers.game_ending_flag.update_infallible(process.read::<u8>(wram_base + 0xEF72).ok().unwrap_or_default() != 0);
-    watchers.time_bonus.update_infallible(process.read::<u16>(wram_base + 0xF7D2).ok().unwrap_or_default().from_be());
+    watchers.end_of_level_flag.update_infallible(
+        process
+            .read::<u8>(wram_base + 0xFAA8)
+            .ok()
+            .unwrap_or_default()
+            != 0,
+    );
+    watchers.game_ending_flag.update_infallible(
+        process
+            .read::<u8>(wram_base + 0xEF72)
+            .ok()
+            .unwrap_or_default()
+            != 0,
+    );
+    watchers.time_bonus.update_infallible(
+        process
+            .read::<u16>(wram_base + 0xF7D2)
+            .ok()
+            .unwrap_or_default()
+            .from_be(),
+    );
     watchers.save_select.update_infallible(save_select);
     watchers.zone_select.update_infallible(zone_select);
     watchers.save_slot.update_infallible(save_slot);
 }
 
 fn start(watchers: &Watchers, settings: &Settings) -> bool {
-    let Some(state) = &watchers.state.pair else { return false };
+    let Some(state) = &watchers.state.pair else {
+        return false;
+    };
 
     if state.old == STATE_SAVESELECT && state.current == STATE_LOADING {
-        let Some(save_select) = &watchers.save_select.pair else { return false };
+        let Some(save_select) = &watchers.save_select.pair else {
+            return false;
+        };
 
         if save_select.current == 0 {
-            return settings.start_nosave
+            return settings.start_nosave;
         } else {
-            let Some(zone_select) = &watchers.zone_select.pair else { return false };
+            let Some(zone_select) = &watchers.zone_select.pair else {
+                return false;
+            };
 
             if zone_select.current == 0 {
-                let Some(save_slot) = &watchers.save_select.pair else { return false };
+                let Some(save_slot) = &watchers.save_select.pair else {
+                    return false;
+                };
                 if save_slot.old == SAVESLOTSTATE_INPROGRESS {
-                    return settings.start_no_clean_save
+                    return settings.start_no_clean_save;
                 } else if save_slot.old == SAVESLOTSTATE_NEWGAME {
-                    return settings.start_clean_save
+                    return settings.start_clean_save;
                 } else if settings.start_new_game_plus {
-                    return true
+                    return true;
                 }
             }
         }
@@ -269,29 +344,45 @@ fn start(watchers: &Watchers, settings: &Settings) -> bool {
 }
 
 fn split(watchers: &Watchers, settings: &Settings) -> bool {
-    let Some(act) = &watchers.levelid.pair else { return false };
-    let Some(game_ending_flag) = &watchers.game_ending_flag.pair else { return false };
+    let Some(act) = &watchers.levelid.pair else {
+        return false;
+    };
+    let Some(game_ending_flag) = &watchers.game_ending_flag.pair else {
+        return false;
+    };
 
     // If current act is AIZ1 (or an invalid stage) there's no need to continue
     if act.current == Levels::AngelIslandAct1 {
         return false;
     }
     // If current act is 21 (Sky Sanctuary) and the ending flag becomes true, trigger Knuckles' ending
-    else if settings.sky_sanctuary && act.current == Levels::SkySanctuary && game_ending_flag.current && !game_ending_flag.old
+    else if settings.sky_sanctuary
+        && act.current == Levels::SkySanctuary
+        && game_ending_flag.current
+        && !game_ending_flag.old
     {
         return true;
     }
 
     // Special Trigger for Death Egg Zone Act 2 in Act 1: in this case a split needs to be triggered when the Time Bonus drops to zero, in accordance to speedrun.com rulings
-    let Some(time_bonus) = &watchers.time_bonus.pair else { return false };
-    let Some(end_level_flag) = &watchers.end_of_level_flag.pair else { return false };
-    if settings.death_egg_2 && act.old == Levels::DeathEggAct2 && time_bonus.old != 0 && time_bonus.current == 0 && end_level_flag.current
+    let Some(time_bonus) = &watchers.time_bonus.pair else {
+        return false;
+    };
+    let Some(end_level_flag) = &watchers.end_of_level_flag.pair else {
+        return false;
+    };
+    if settings.death_egg_2
+        && act.old == Levels::DeathEggAct2
+        && time_bonus.old != 0
+        && time_bonus.current == 0
+        && end_level_flag.current
     {
         return true;
     }
 
     // Normal splitting condition: trigger a split whenever the act changes
-    act.old != act.current && match act.old {
+    act.old != act.current
+        && match act.old {
             Levels::AngelIslandAct1 => settings.angel_island_1 && end_level_flag.old,
             Levels::AngelIslandAct2 => settings.angel_island_2,
             Levels::HydrocityAct1 => settings.hydrocity_1,
@@ -322,17 +413,23 @@ fn split(watchers: &Watchers, settings: &Settings) -> bool {
 }
 
 fn reset(watchers: &Watchers, settings: &Settings) -> bool {
-    let Some(save_select) = &watchers.save_select.pair else { return false };
+    let Some(save_select) = &watchers.save_select.pair else {
+        return false;
+    };
 
     if save_select.current == 0 {
-        let Some(state) = &watchers.state.pair else { return false };
+        let Some(state) = &watchers.state.pair else {
+            return false;
+        };
         if state.old == STATE_SAVESELECT && state.current == STATE_LOADING {
-            return settings.reset
+            return settings.reset;
         }
     } else if save_select.current > 0 && save_select.current <= 8 && !save_select.changed() {
-        let Some(save_slot) = &watchers.save_slot.pair else { return false };
+        let Some(save_slot) = &watchers.save_slot.pair else {
+            return false;
+        };
         if save_slot.old != SAVESLOTSTATE_NEWGAME && save_slot.current == SAVESLOTSTATE_NEWGAME {
-            return settings.reset
+            return settings.reset;
         }
     }
     false
